@@ -94,7 +94,7 @@ def decide(snap: MarketSnapshot) -> TradeDecision:
     prem = snap.straddle_premium
 
     # ── Rule 1: minimum premium gate ────────────────────────────────────────
-    MIN_PREMIUM = 120.0
+    MIN_PREMIUM = 80.0
     if prem < MIN_PREMIUM:
         return TradeDecision(
             strategy="NO_TRADE",

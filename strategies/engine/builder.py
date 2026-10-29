@@ -148,18 +148,20 @@ def _build_bear_call_spread(snap: MarketSnapshot, qty: int) -> TradeSpec:
 
 def _build_iron_condor(snap: MarketSnapshot, qty: int) -> TradeSpec:
     atm = snap.atm_strike
+    # sell 2 strikes OTM, buy 4 strikes OTM — each wing = 2 intervals = 100pts
     sell_ce = atm + (2 * STRIKE_INTERVAL)
     buy_ce  = atm + (4 * STRIKE_INTERVAL)
     sell_pe = atm - (2 * STRIKE_INTERVAL)
     buy_pe  = atm - (4 * STRIKE_INTERVAL)
-    spread_width = 2 * STRIKE_INTERVAL  # 100 points each side
+    wing_width = 2 * STRIKE_INTERVAL  # 100pts per wing
 
-    ce_credit = round(snap.atm_ce_ltp * 0.30, 2)
-    pe_credit = round(snap.atm_pe_ltp * 0.30, 2)
+    # 2 strikes OTM ~ 15% of ATM LTP is a realistic estimate
+    ce_credit  = round(snap.atm_ce_ltp * 0.15, 2)
+    pe_credit  = round(snap.atm_pe_ltp * 0.15, 2)
     net_credit = round(ce_credit + pe_credit, 2)
 
     max_profit = round(net_credit * qty, 0)
-    max_loss   = round((spread_width - net_credit) * qty, 0)
+    max_loss   = round((wing_width - net_credit) * qty, 0)
     rr = round(max_profit / max_loss, 2) if max_loss > 0 else 0
 
     legs = [
@@ -176,10 +178,10 @@ def _build_iron_condor(snap: MarketSnapshot, qty: int) -> TradeSpec:
         risk_reward=rr,
         entry_reason=f"CE {sell_ce}/{buy_ce} PE {sell_pe}/{buy_pe} Credit~Rs.{net_credit} Qty={qty}",
     )
-    if net_credit < 30:
-        spec.reject_reason = f"Net credit Rs.{net_credit} too low for condor (min Rs.30)"
-    elif rr < 0.20:
-        spec.reject_reason = f"Risk/reward {rr} too low for condor (min 0.20)"
+    if net_credit < 15:
+        spec.reject_reason = f"Net credit Rs.{net_credit} too low for condor (min Rs.15)"
+    elif rr < 0.10:
+        spec.reject_reason = f"Risk/reward {rr} too low for condor (min 0.10)"
     return spec
 
 

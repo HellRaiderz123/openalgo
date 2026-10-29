@@ -42,16 +42,8 @@ def _compute_pcr_and_atm(chain: dict, spot: float) -> Tuple[float, int, float, f
     atm_pe_ltp  = 0.0
     atm_strike  = 0
 
-    # find ATM strike = closest to spot
-    best_diff = float("inf")
-    for row in rows:
-        strike = float(row.get("strike") or 0)
-        if strike <= 0:
-            continue
-        diff = abs(strike - spot)
-        if diff < best_diff:
-            best_diff = diff
-            atm_strike = int(strike)
+    # find ATM strike = nearest 50-point strike to spot (mathematical, not chain-dependent)
+    atm_strike = int(round(spot / 50) * 50)
 
     for row in rows:
         strike = float(row.get("strike") or 0)
@@ -62,6 +54,11 @@ def _compute_pcr_and_atm(chain: dict, spot: float) -> Tuple[float, int, float, f
         if int(strike) == atm_strike:
             atm_ce_ltp = float(ce.get("ltp") or 0)
             atm_pe_ltp = float(pe.get("ltp") or 0)
+            # Debug: if PE is 0, try to get from other fields
+            if atm_pe_ltp <= 0:
+                atm_pe_ltp = float(pe.get("last_price") or pe.get("close") or 0)
+            if atm_ce_ltp <= 0:
+                atm_ce_ltp = float(ce.get("last_price") or ce.get("close") or 0)
 
     pcr = (total_pe_oi / total_ce_oi) if total_ce_oi > 0 else 1.0
     return round(pcr, 3), atm_strike, atm_ce_ltp, atm_pe_ltp, total_ce_oi, total_pe_oi

@@ -5,6 +5,7 @@ import {
   ChevronDown,
   ChevronRight,
   Download,
+  LineChart,
   Loader2,
   Pause,
   Radio,
@@ -60,6 +61,7 @@ import { onModeChange } from '@/stores/themeStore'
 import type { Position } from '@/types/trading'
 import { showToast } from '@/utils/toast'
 import { EmptyState } from '@/components/ui/empty-state'
+import { PositionPayoffChart } from '@/components/positions/PositionPayoffChart'
 
 const STORAGE_KEY = 'openalgo_positions_prefs'
 
@@ -99,6 +101,128 @@ function parseSymbol(symbol: string, exchange: string) {
   }
 
   return { underlying: symbol, expiry: null, strike: null, optionType: null }
+}
+
+/**
+ * Detect strategy name from a group of option positions.
+ * Analyzes the structure of legs to identify common option strategies.
+ */
+function detectStrategyName(positions: Position[]): string | null {
+  const optionPositions = positions.filter((p) => {
+    const qty = Number(p.quantity) || 0
+    if (qty === 0) return false
+    const parsed = parseSymbol(p.symbol, p.exchange)
+    return parsed.optionType === 'CE' || parsed.optionType === 'PE'
+  })
+
+  if (optionPositions.length === 0) return null
+
+  // Parse all legs
+  const legs = optionPositions.map((p) => {
+    const parsed = parseSymbol(p.symbol, p.exchange)
+    const qty = Number(p.quantity) || 0
+    return {
+      strike: parseFloat(parsed.strike || '0'),
+      type: parsed.optionType as 'CE' | 'PE',
+      side: qty > 0 ? 'BUY' : 'SELL',
+      qty: Math.abs(qty),
+    }
+  })
+
+  const calls = legs.filter((l) => l.type === 'CE')
+  const puts = legs.filter((l) => l.type === 'PE')
+  const buys = legs.filter((l) => l.side === 'BUY')
+  const sells = legs.filter((l) => l.side === 'SELL')
+
+  // Single leg strategies
+  if (legs.length === 1) {
+    const leg = legs[0]
+    if (leg.type === 'CE' && leg.side === 'BUY') return 'Long Call'
+    if (leg.type === 'CE' && leg.side === 'SELL') return 'Short Call'
+    if (leg.type === 'PE' && leg.side === 'BUY') return 'Long Put'
+    if (leg.type === 'PE' && leg.side === 'SELL') return 'Short Put'
+  }
+
+  // Two leg strategies
+  if (legs.length === 2) {
+    // Straddle: same strike, one CE one PE
+    if (calls.length === 1 && puts.length === 1 && calls[0].strike === puts[0].strike) {
+      if (buys.length === 2) return 'Long Straddle'
+      if (sells.length === 2) return 'Short Straddle'
+    }
+
+    // Strangle: different strikes, one CE one PE
+    if (calls.length === 1 && puts.length === 1 && calls[0].strike !== puts[0].strike) {
+      if (buys.length === 2) return 'Long Strangle'
+      if (sells.length === 2) return 'Short Strangle'
+    }
+
+    // Vertical spreads
+    if (calls.length === 2 && buys.length === 1 && sells.length === 1) {
+      const buyCall = calls.find((c) => c.side === 'BUY')!
+      const sellCall = calls.find((c) => c.side === 'SELL')!
+      if (buyCall.strike < sellCall.strike) return 'Bull Call Spread'
+      return 'Bear Call Spread'
+    }
+
+    if (puts.length === 2 && buys.length === 1 && sells.length === 1) {
+      const buyPut = puts.find((p) => p.side === 'BUY')!
+      const sellPut = puts.find((p) => p.side === 'SELL')!
+      if (buyPut.strike > sellPut.strike) return 'Bear Put Spread'
+      return 'Bull Put Spread'
+    }
+  }
+
+  // Four leg strategies
+  if (legs.length === 4) {
+    // Iron Condor: sell OTM put, buy further OTM put, sell OTM call, buy further OTM call
+    if (calls.length === 2 && puts.length === 2 && buys.length === 2 && sells.length === 2) {
+      const sellCall = calls.find((c) => c.side === 'SELL')
+      const buyCall = calls.find((c) => c.side === 'BUY')
+      const sellPut = puts.find((p) => p.side === 'SELL')
+      const buyPut = puts.find((p) => p.side === 'BUY')
+      if (sellCall && buyCall && sellPut && buyPut) {
+        if (buyCall.strike > sellCall.strike && buyPut.strike < sellPut.strike) {
+          return 'Iron Condor'
+        }
+        if (buyCall.strike < sellCall.strike && buyPut.strike > sellPut.strike) {
+          return 'Reverse Iron Condor'
+        }
+      }
+    }
+
+    // Iron Butterfly: same middle strike for sells
+    if (calls.length === 2 && puts.length === 2) {
+      const sellCall = calls.find((c) => c.side === 'SELL')
+      const sellPut = puts.find((p) => p.side === 'SELL')
+      if (sellCall && sellPut && sellCall.strike === sellPut.strike) {
+        return sells.length === 2 ? 'Iron Butterfly' : 'Reverse Iron Butterfly'
+      }
+    }
+  }
+
+  // Three leg strategies (Butterfly)
+  if (legs.length === 3) {
+    if (calls.length === 3 || puts.length === 3) {
+      const sorted = [...legs].sort((a, b) => a.strike - b.strike)
+      // Butterfly: buy low, sell 2x middle, buy high
+      if (
+        sorted[0].side === 'BUY' &&
+        sorted[1].side === 'SELL' &&
+        sorted[2].side === 'BUY' &&
+        sorted[1].qty === sorted[0].qty + sorted[2].qty
+      ) {
+        return calls.length === 3 ? 'Call Butterfly' : 'Put Butterfly'
+      }
+    }
+  }
+
+  // Generic multi-leg
+  if (legs.length > 1) {
+    return `${legs.length}-Leg Strategy`
+  }
+
+  return null
 }
 
 function calculatePnlPercent(position: Position): number {
@@ -166,6 +290,7 @@ export default function Positions() {
     exchange: [],
   })
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
+  const [showPayoffGroups, setShowPayoffGroups] = useState<Set<string>>(new Set())
   const [sortColumn, setSortColumn] = useState<SortColumn>(null)
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc')
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -578,7 +703,38 @@ export default function Positions() {
     })
 
     const pnlPercent = totalInvestment > 0 ? (totalPnl / totalInvestment) * 100 : 0
-    return { totalPnl, pnlPercent, count: positions.length }
+    const strategyName = detectStrategyName(positions)
+    return { totalPnl, pnlPercent, count: positions.length, strategyName }
+  }
+
+  const togglePayoff = (groupKey: string) => {
+    setShowPayoffGroups((prev) => {
+      const next = new Set(prev)
+      if (next.has(groupKey)) {
+        next.delete(groupKey)
+      } else {
+        next.add(groupKey)
+      }
+      return next
+    })
+  }
+
+  // Get spot price for a group (use first position's LTP as proxy)
+  const getGroupSpot = (positions: Position[]): number => {
+    // Try to find underlying spot from positions
+    for (const pos of positions) {
+      if (pos.ltp && pos.ltp > 0) {
+        // For options, we need the underlying spot, not option LTP
+        // Use a rough estimate based on strike prices
+        const parsed = parseSymbol(pos.symbol, pos.exchange)
+        if (parsed.strike) {
+          return parseFloat(parsed.strike)
+        }
+      }
+    }
+    // Fallback to first position's LTP
+    const firstWithLtp = positions.find((p) => p.ltp && p.ltp > 0)
+    return firstWithLtp?.ltp || 0
   }
 
   // Sort group keys
@@ -910,7 +1066,7 @@ export default function Positions() {
                             className="bg-muted/50 cursor-pointer hover:bg-muted"
                             onClick={() => toggleGroup(groupKey)}
                           >
-                            <TableCell colSpan={6}>
+                            <TableCell colSpan={5}>
                               <div className="flex items-center gap-3 py-1 font-semibold">
                                 {isCollapsed ? (
                                   <ChevronRight className="h-4 w-4 text-muted-foreground" />
@@ -921,7 +1077,35 @@ export default function Positions() {
                                 <Badge variant="outline" className="text-xs">
                                   {groupStats.count}
                                 </Badge>
+                                {groupStats.strategyName && (
+                                  <Badge
+                                    variant="secondary"
+                                    className="bg-violet-500/10 text-violet-600 border-violet-500/30 text-xs"
+                                  >
+                                    {groupStats.strategyName}
+                                  </Badge>
+                                )}
                               </div>
+                            </TableCell>
+                            <TableCell className="text-right">
+                              {/* Payoff Chart Toggle */}
+                              {groupStats.strategyName && (
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className={cn(
+                                    'h-7 px-2',
+                                    showPayoffGroups.has(groupKey) && 'bg-violet-500/10 text-violet-600'
+                                  )}
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    togglePayoff(groupKey)
+                                  }}
+                                  title="Toggle payoff chart"
+                                >
+                                  <LineChart className="h-4 w-4" />
+                                </Button>
+                              )}
                             </TableCell>
                             <TableCell
                               className={cn(
@@ -942,6 +1126,22 @@ export default function Positions() {
                               {groupStats.pnlPercent.toFixed(2)}%
                             </TableCell>
                             <TableCell />
+                          </TableRow>
+                        )}
+
+                        {/* Payoff Chart Row */}
+                        {grouping !== 'none' && showPayoffGroups.has(groupKey) && !isCollapsed && (
+                          <TableRow className="bg-muted/30">
+                            <TableCell colSpan={9} className="p-0">
+                              <div className="p-4">
+                                <PositionPayoffChart
+                                  positions={groupPositions}
+                                  spot={getGroupSpot(groupPositions)}
+                                  height={220}
+                                  formatCurrency={formatCurrency}
+                                />
+                              </div>
+                            </TableCell>
                           </TableRow>
                         )}
 

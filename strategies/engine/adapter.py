@@ -18,8 +18,9 @@ class MarketDataAdapter:
 
     def get_vix(self) -> Optional[float]:
         try:
-            r = self._c.quotes(symbol="INDIA VIX", exchange="NSE_INDEX")
-            val = (r.get("data") or r).get("ltp") or (r.get("data") or r).get("close")
+            r    = self._c.quotes(symbol="INDIAVIX", exchange="NSE_INDEX")
+            data = r.get("data") or r
+            val  = data.get("ltp") or data.get("close")
             return float(val) if val else None
         except Exception:
             return None
@@ -32,7 +33,7 @@ class MarketDataAdapter:
         except Exception:
             return None
 
-    def get_option_chain(self, expiry: str, strike_count: int = 10) -> Optional[dict]:
+    def get_option_chain(self, expiry: str, strike_count: int = 15) -> Optional[dict]:
         try:
             r = self._c.optionchain(
                 underlying="NIFTY",
