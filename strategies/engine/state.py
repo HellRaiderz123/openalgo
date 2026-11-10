@@ -17,22 +17,24 @@ class PositionState:
     squared_off: bool = False
     strategy: str = ""
     legs: List[Leg] = field(default_factory=list)
-    entry_premium: float = 0.0   # total premium collected at entry
+    entry_premium: float = 0.0
     current_premium: float = 0.0
     mtm_pnl: float = 0.0
     daily_pnl: float = 0.0
     session_date: Optional[date] = None
+    _closed_pnl: float = 0.0   # locked-in P&L from trades already exited today
 
     def reset_for_new_day(self, today: date):
-        self.in_trade     = False
-        self.squared_off  = False
-        self.strategy     = ""
-        self.legs         = []
-        self.entry_premium  = 0.0
+        self.in_trade        = False
+        self.squared_off     = False
+        self.strategy        = ""
+        self.legs            = []
+        self.entry_premium   = 0.0
         self.current_premium = 0.0
-        self.mtm_pnl      = 0.0
-        self.daily_pnl    = 0.0
-        self.session_date = today
+        self.mtm_pnl         = 0.0
+        self.daily_pnl       = 0.0
+        self._closed_pnl     = 0.0
+        self.session_date    = today
 
     def enter(self, spec: TradeSpec, entry_premium: float):
         self.in_trade      = True
@@ -44,9 +46,11 @@ class PositionState:
         self.current_premium = current_premium
         # for short strategies: profit = entry - current (premium decays)
         self.mtm_pnl  = round((self.entry_premium - current_premium) * qty, 2)
-        self.daily_pnl = self.mtm_pnl
+        # daily_pnl accumulates: prior closed trades + current open MTM
+        self.daily_pnl = round(self._closed_pnl + self.mtm_pnl, 2)
 
     def exit(self):
+        self._closed_pnl += self.mtm_pnl   # lock in this trade's P&L
         self.in_trade    = False
         self.squared_off = True
 

@@ -20,7 +20,7 @@ NIFTY strike interval = 50 points
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 from .normalizer import MarketSnapshot
 from .decision import TradeDecision
 
@@ -55,6 +55,27 @@ def _round_to_strike(price: float) -> int:
     return int(round(price / STRIKE_INTERVAL) * STRIKE_INTERVAL)
 
 
+def _chain_ltp_map(snap: MarketSnapshot) -> Dict[Tuple[int, str], float]:
+    """
+    Build a (strike, option_type) -> ltp lookup from the raw chain rows
+    stored on the snapshot. Falls back to empty dict if chain unavailable.
+    """
+    ltp_map: Dict[Tuple[int, str], float] = {}
+    for row in getattr(snap, "_chain_rows", []):
+        strike = int(float(row.get("strike") or 0))
+        for side, otype in (("ce", "CE"), ("pe", "PE")):
+            d = row.get(side) or {}
+            ltp = float(d.get("ltp") or d.get("last_price") or d.get("close") or 0)
+            if ltp > 0:
+                ltp_map[(strike, otype)] = ltp
+    return ltp_map
+
+
+def _get_ltp(ltp_map: Dict, strike: int, otype: str, fallback: float) -> float:
+    """Return real chain LTP for a strike, or fallback estimate if not found."""
+    return ltp_map.get((strike, otype), fallback)
+
+
 def _build_short_straddle(snap: MarketSnapshot, qty: int, max_loss_inr: float) -> TradeSpec:
     atm = snap.atm_strike
     premium = snap.straddle_premium
@@ -85,9 +106,9 @@ def _build_bull_put_spread(snap: MarketSnapshot, qty: int) -> TradeSpec:
     buy_strike  = atm - (3 * STRIKE_INTERVAL)    # 3 strikes below ATM (hedge)
     spread_width = sell_strike - buy_strike       # 100 points
 
-    # Approximate: sell strike PE premium ~ 40-60% of ATM PE
-    sell_premium = round(snap.atm_pe_ltp * 0.50, 2)
-    buy_premium  = round(snap.atm_pe_ltp * 0.20, 2)
+    ltp_map      = _chain_ltp_map(snap)
+    sell_premium = round(_get_ltp(ltp_map, sell_strike, "PE", snap.atm_pe_ltp * 0.50), 2)
+    buy_premium  = round(_get_ltp(ltp_map, buy_strike,  "PE", snap.atm_pe_ltp * 0.20), 2)
     net_credit   = round(sell_premium - buy_premium, 2)
 
     max_profit = round(net_credit * qty, 0)
@@ -119,8 +140,9 @@ def _build_bear_call_spread(snap: MarketSnapshot, qty: int) -> TradeSpec:
     buy_strike  = atm + (3 * STRIKE_INTERVAL)    # 3 strikes above ATM (hedge)
     spread_width = buy_strike - sell_strike       # 100 points
 
-    sell_premium = round(snap.atm_ce_ltp * 0.50, 2)
-    buy_premium  = round(snap.atm_ce_ltp * 0.20, 2)
+    ltp_map      = _chain_ltp_map(snap)
+    sell_premium = round(_get_ltp(ltp_map, sell_strike, "CE", snap.atm_ce_ltp * 0.50), 2)
+    buy_premium  = round(_get_ltp(ltp_map, buy_strike,  "CE", snap.atm_ce_ltp * 0.20), 2)
     net_credit   = round(sell_premium - buy_premium, 2)
 
     max_profit = round(net_credit * qty, 0)
@@ -155,9 +177,11 @@ def _build_iron_condor(snap: MarketSnapshot, qty: int) -> TradeSpec:
     buy_pe  = atm - (4 * STRIKE_INTERVAL)
     wing_width = 2 * STRIKE_INTERVAL  # 100pts per wing
 
-    # 2 strikes OTM ~ 15% of ATM LTP is a realistic estimate
-    ce_credit  = round(snap.atm_ce_ltp * 0.15, 2)
-    pe_credit  = round(snap.atm_pe_ltp * 0.15, 2)
+    ltp_map    = _chain_ltp_map(snap)
+    ce_credit  = round(_get_ltp(ltp_map, sell_ce, "CE", snap.atm_ce_ltp * 0.15) -
+                       _get_ltp(ltp_map, buy_ce,  "CE", snap.atm_ce_ltp * 0.05), 2)
+    pe_credit  = round(_get_ltp(ltp_map, sell_pe, "PE", snap.atm_pe_ltp * 0.15) -
+                       _get_ltp(ltp_map, buy_pe,  "PE", snap.atm_pe_ltp * 0.05), 2)
     net_credit = round(ce_credit + pe_credit, 2)
 
     max_profit = round(net_credit * qty, 0)

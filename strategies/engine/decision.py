@@ -7,9 +7,15 @@ Takes a validated MarketSnapshot, returns (strategy, reason).
 Strategies:
     BULL_PUT_SPREAD   — sell OTM put spread, bullish bias
     BEAR_CALL_SPREAD  — sell OTM call spread, bearish bias
-    IRON_CONDOR       — sell both sides, neutral + high IV
-    SHORT_STRADDLE    — sell ATM CE+PE, neutral + very high IV
+    IRON_CONDOR       — sell both sides, neutral + normal IV
+    SHORT_STRADDLE    — sell ATM CE+PE, neutral + VERY HIGH IV only (VIX >= 18)
     NO_TRADE          — conditions not met
+
+VIX regimes:
+    LOW     < 11    — premium crushed, don't sell
+    NORMAL  11-17   — spreads and condors only (defined risk)
+    HIGH    17-22   — spreads preferred; straddle only if VIX >= 18 AND neutral
+    EXTREME > 22    — gap risk too high, no trade
 
 Decision logic uses only 3 inputs:
     1. VIX         — IV regime
@@ -36,22 +42,27 @@ class TradeDecision:
 def _iv_regime(vix: float) -> str:
     if vix < 11:
         return "LOW"
-    if vix <= 16:
-        return "NORMAL"
+    if vix < 17:
+        return "NORMAL"   # 11-16.99 — spreads/condors only
     if vix <= 22:
-        return "HIGH"
+        return "HIGH"     # 17-22 — spreads preferred; straddle only if VIX >= 18
     return "EXTREME"
 
 
 def _bias(pcr: float) -> str:
     """
     PCR interpretation (contrarian):
-    High PCR = lots of put buying = fear = market likely to hold or bounce = BULLISH
-    Low PCR  = lots of call buying = greed = market likely to stall or fall = BEARISH
+    High PCR = lots of put buying/writing = fear = market likely to hold or bounce = BULLISH
+    Low PCR  = lots of call buying/writing = greed = market likely to stall or fall = BEARISH
+
+    Thresholds calibrated against Sensibull full-market PCR:
+        >= 1.3  → BULLISH  (strong put OI dominance)
+        <= 0.65 → BEARISH  (strong call OI dominance — tightened from 0.75)
+        else    → NEUTRAL  (wider neutral band reduces false signals)
     """
     if pcr >= 1.3:
         return "BULLISH"
-    if pcr <= 0.75:
+    if pcr <= 0.65:
         return "BEARISH"
     return "NEUTRAL"
 
@@ -63,31 +74,28 @@ def decide(snap: MarketSnapshot) -> TradeDecision:
     Rules (in priority order):
 
     1. Premium too low → NO_TRADE always
-       No point selling if there's nothing to collect.
 
     2. EXTREME VIX (>22) → NO_TRADE
-       Gap risk too high. Market is in panic. Short options get destroyed.
+       Gap risk too high.
 
     3. LOW VIX (<11) → NO_TRADE
-       Premium is crushed. Risk/reward doesn't work for sellers.
+       Premium crushed.
 
-    4. HIGH VIX (16-22) + NEUTRAL bias → SHORT_STRADDLE
-       Best environment for straddle sellers. High premium, range-bound.
+    4. HIGH VIX (17-22) + NEUTRAL + VIX >= 18 → SHORT_STRADDLE
+       Genuine elevated IV. Enough premium to justify unlimited-risk straddle.
 
-    5. HIGH VIX (16-22) + BULLISH bias → BULL_PUT_SPREAD
-       High IV means fat put premiums. Sell puts with hedge.
+    5. HIGH VIX (17-22) + NEUTRAL + VIX < 18 → IRON_CONDOR
+       Borderline IV. Defined risk is safer.
 
-    6. HIGH VIX (16-22) + BEARISH bias → BEAR_CALL_SPREAD
-       High IV means fat call premiums. Sell calls with hedge.
+    6. HIGH VIX + BULLISH → BULL_PUT_SPREAD
 
-    7. NORMAL VIX (11-16) + NEUTRAL → IRON_CONDOR
-       Defined risk, collect from both sides in range.
+    7. HIGH VIX + BEARISH → BEAR_CALL_SPREAD
 
-    8. NORMAL VIX (11-16) + BULLISH → BULL_PUT_SPREAD
-       Sell OTM puts, keep upside.
+    8. NORMAL VIX (11-17) + NEUTRAL → IRON_CONDOR
 
-    9. NORMAL VIX (11-16) + BEARISH → BEAR_CALL_SPREAD
-       Sell OTM calls, keep downside.
+    9. NORMAL VIX + BULLISH → BULL_PUT_SPREAD
+
+    10. NORMAL VIX + BEARISH → BEAR_CALL_SPREAD
     """
     iv  = _iv_regime(snap.vix)
     bias = _bias(snap.pcr)
@@ -121,15 +129,37 @@ def decide(snap: MarketSnapshot) -> TradeDecision:
             reason=f"VIX={snap.vix} too low — premium crushed, risk/reward unfavorable",
         )
 
-    # ── Rule 4-6: HIGH VIX ───────────────────────────────────────────────────
+    # ── Rule 3b: VIX spiking ─────────────────────────────────────────────────
+    # A rising VIX means the market expects more movement — bad for short options.
+    # Block all premium-selling strategies when VIX is up >5% intraday.
+    VIX_SPIKE_THRESHOLD = 5.0
+    if snap.vix_change_pct >= VIX_SPIKE_THRESHOLD:
+        return TradeDecision(
+            strategy="NO_TRADE",
+            bias=bias,
+            iv_regime=iv,
+            reason=f"VIX spiking +{snap.vix_change_pct}% today — short premium too risky",
+        )
+
+    # ── Rule 4-6: HIGH VIX (17-22) ───────────────────────────────────────────
+    # SHORT_STRADDLE only when VIX >= 18 (genuine elevated IV) AND neutral bias.
+    # VIX 17-17.99 is borderline — use defined-risk IRON_CONDOR instead.
     if iv == "HIGH":
         if bias == "NEUTRAL":
-            return TradeDecision(
-                strategy="SHORT_STRADDLE",
-                bias=bias,
-                iv_regime=iv,
-                reason=f"HIGH IV + neutral PCR={snap.pcr} — ideal straddle environment",
-            )
+            if snap.vix >= 18.0:
+                return TradeDecision(
+                    strategy="SHORT_STRADDLE",
+                    bias=bias,
+                    iv_regime=iv,
+                    reason=f"VIX={snap.vix} >= 18 + neutral PCR={snap.pcr} — genuine high IV straddle",
+                )
+            else:
+                return TradeDecision(
+                    strategy="IRON_CONDOR",
+                    bias=bias,
+                    iv_regime=iv,
+                    reason=f"VIX={snap.vix} borderline (17-18) + neutral PCR={snap.pcr} — condor safer than straddle",
+                )
         if bias == "BULLISH":
             return TradeDecision(
                 strategy="BULL_PUT_SPREAD",

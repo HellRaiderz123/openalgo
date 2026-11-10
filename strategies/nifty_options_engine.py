@@ -24,6 +24,7 @@ import sys
 import sqlite3
 import time
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -62,7 +63,7 @@ SQUARE_OFF_HOUR      = int(os.getenv("SQUARE_OFF_HOUR",      "15"))
 SQUARE_OFF_MIN       = int(os.getenv("SQUARE_OFF_MIN",       "10"))
 PAPER_MODE           = os.getenv("PAPER_MODE", "true").lower() != "false"
 ENTRY_START_H        = int(os.getenv("ENTRY_START_HOUR", "9"))
-ENTRY_START_M        = int(os.getenv("ENTRY_START_MIN",  "20"))
+ENTRY_START_M        = int(os.getenv("ENTRY_START_MIN",  "35"))  # wait for OI to stabilise post-open
 ENTRY_END_H          = int(os.getenv("ENTRY_END_HOUR",   "13"))
 ENTRY_END_M          = int(os.getenv("ENTRY_END_MIN",    "0"))
 PRODUCT              = "NRML"
@@ -127,30 +128,36 @@ def get_expiry_and_lotsize():
         return None, 65
 
 
-def _calc_net_premium(chain: dict, spec) -> float:
+def _calc_net_premium(chain: dict, spec) -> Optional[float]:
     """
     Calculate NET spread premium (SELL legs - BUY legs).
-    This correctly tracks P&L for spreads/condors where hedge legs offset losses.
+    Returns None if any matched leg has a zero/missing LTP — caller must skip MTM update.
     """
     sell_strikes = {(leg.strike, leg.option_type) for leg in spec.legs if leg.action == "SELL"}
     buy_strikes  = {(leg.strike, leg.option_type) for leg in spec.legs if leg.action == "BUY"}
-    sell_total = 0.0
-    buy_total  = 0.0
+    found_sell   = {k: None for k in sell_strikes}
+    found_buy    = {k: None for k in buy_strikes}
     for row in chain.get("chain", []):
         strike = int(float(row.get("strike") or 0))
         for side, otype in (("ce", "CE"), ("pe", "PE")):
             ltp = float((row.get(side) or {}).get("ltp") or 0)
-            if (strike, otype) in sell_strikes:
-                sell_total += ltp
-            if (strike, otype) in buy_strikes:
-                buy_total += ltp
-    return sell_total - buy_total  # Net premium (positive = credit)
+            key = (strike, otype)
+            if key in found_sell:
+                found_sell[key] = ltp
+            if key in found_buy:
+                found_buy[key] = ltp
+    # Reject if any leg is missing or zero
+    for key, ltp in {**found_sell, **found_buy}.items():
+        if ltp is None or ltp == 0.0:
+            return None
+    return sum(found_sell.values()) - sum(found_buy.values())
 
 
 # ── entry window ──────────────────────────────────────────────────────────────
 def in_entry_window():
     now = ist_now()
-    if now.weekday() == 0:  # Skip Monday — overnight gap risk
+    # Skip Monday morning only (gap risk at open); afternoon is fine
+    if now.weekday() == 0 and hm(now) < (11, 0):
         return False
     return (ENTRY_START_H, ENTRY_START_M) <= hm(now) <= (ENTRY_END_H, ENTRY_END_M)
 
@@ -201,8 +208,9 @@ def run():
             # ── daily loss limit ──────────────────────────────────────────────
             if not state.squared_off and state.daily_limit_hit(DAILY_LOSS_LIMIT_INR):
                 log(f"Daily loss limit hit Rs.{state.daily_pnl} — squaring off")
-                executor.close_all(STRATEGY_NAME, log)
-                state.exit()
+                if state.in_trade:
+                    executor.close_all(STRATEGY_NAME, log)
+                state.squared_off = True
 
             if state.squared_off:
                 time.sleep(SLEEP_SECONDS)
@@ -220,31 +228,19 @@ def run():
             if not state.in_trade and in_entry_window():
 
                 # 1. fetch market data
-                vix   = adapter.get_vix()
-                spot  = adapter.get_nifty_spot()
-                chain = adapter.get_option_chain(expiry)
-
-                # Debug: Print raw chain data for ATM strike
-                if chain:
-                    rows = chain.get("chain", [])
-                    if rows:
-                        atm_approx = int(round((spot or 23000) / 50) * 50)
-                        for row in rows:
-                            strike = int(float(row.get("strike") or 0))
-                            if abs(strike - atm_approx) <= 50:
-                                ce = row.get("ce") or {}
-                                pe = row.get("pe") or {}
-                                log(f"DEBUG ATM Row | Strike={strike} CE={ce} PE={pe}")
-                                break
+                vix, vix_prev = adapter.get_vix_data()
+                spot     = adapter.get_nifty_spot()
+                chain, pcr = adapter.get_option_chain_with_pcr(expiry)
+                log(f"PCR(full)={pcr}" if pcr else "PCR(full)=None — will use chain-computed fallback")
 
                 # 2. normalize + validate
-                snapshot, reason = normalize(vix, spot, chain)
+                snapshot, reason = normalize(vix, spot, chain, pcr, vix_prev)
                 if snapshot is None:
                     log(f"SKIP: {reason}")
                     time.sleep(SLEEP_SECONDS)
                     continue
 
-                log(f"Snapshot | VIX={snapshot.vix}  PCR={snapshot.pcr}"
+                log(f"Snapshot | VIX={snapshot.vix} ({snapshot.vix_change_pct:+.1f}%)  PCR={snapshot.pcr}"
                     f"  Premium=Rs.{snapshot.straddle_premium}  Spot={snapshot.spot}")
 
                 # 3. decide strategy
@@ -270,7 +266,14 @@ def run():
                 ok = executor.execute(spec, expiry, log)
                 if ok:
                     chain_at_entry = adapter.get_option_chain(expiry)
-                    entry_prem = _calc_net_premium(chain_at_entry, spec) if chain_at_entry else snapshot.straddle_premium
+                    entry_prem = _calc_net_premium(chain_at_entry, spec) if chain_at_entry else None
+                    if entry_prem is None:
+                        # Fallback: compute net credit from snapshot chain rows directly
+                        entry_prem = _calc_net_premium({"chain": snapshot._chain_rows or []}, spec)
+                    if entry_prem is None or entry_prem == 0.0:
+                        log("WARN: entry premium is zero/unavailable — skipping state.enter to avoid bad MTM baseline")
+                        time.sleep(SLEEP_SECONDS)
+                        continue
                     state.enter(spec, entry_prem)
                     log(f"ENTERED {spec.strategy} | NetPremium=Rs.{entry_prem}")
 
@@ -279,11 +282,10 @@ def run():
 
             # ── MTM monitoring ────────────────────────────────────────────────
             if state.in_trade and spec:
-                # Single API call for chain — reuse for MTM + regime check
-                vix   = adapter.get_vix()
-                spot  = adapter.get_nifty_spot()
-                chain = adapter.get_option_chain(expiry)
-                
+                vix, vix_prev = adapter.get_vix_data()
+                spot     = adapter.get_nifty_spot()
+                chain, pcr = adapter.get_option_chain_with_pcr(expiry)
+
                 if not chain:
                     log("WARNING: Could not fetch option chain for MTM")
                     time.sleep(SLEEP_IN_TRADE)
@@ -291,6 +293,10 @@ def run():
 
                 # Calculate NET premium (SELL - BUY legs)
                 current = _calc_net_premium(chain, spec)
+                if current is None:
+                    log("MTM SKIP: one or more leg LTPs are zero — stale quote, retrying")
+                    time.sleep(SLEEP_IN_TRADE)
+                    continue
                 state.update_mtm(current, qty)
                 log(f"MTM=Rs.{state.mtm_pnl}  Entry={state.entry_premium}  Now={current}")
 
@@ -310,7 +316,7 @@ def run():
                     continue
 
                 # ── PRIORITY 2: Strategy change exit ──────────────────────────
-                new_snap, _ = normalize(vix, spot, chain)
+                new_snap, _ = normalize(vix, spot, chain, pcr, vix_prev)
                 if new_snap:
                     new_decision = decide(new_snap)
                     if new_decision.strategy != spec.strategy:
